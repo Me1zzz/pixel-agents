@@ -7,16 +7,17 @@ import { buildDynamicCatalog } from '../office/layout/furnitureCatalog.js';
 import { migrateLayoutColors } from '../office/layout/layoutSerializer.js';
 import { setCharacterTemplates } from '../office/sprites/spriteData.js';
 import { extractToolName } from '../office/toolUtils.js';
-import type { OfficeLayout, ToolActivity } from '../office/types.js';
+import type { OfficeLayout } from '../office/types.js';
 import { setWallSprites } from '../office/wallTiles.js';
+import {
+  createEmptyOfficeBucket,
+  createOfficeBuckets,
+  DEFAULT_OFFICE_ID,
+  mergeOfficeCatalog,
+  resolveOfficeId,
+} from '../offices/officeStore.js';
+import type { OfficeBucketState, OfficeDescriptor } from '../offices/officeTypes.js';
 import { vscode } from '../vscodeApi.js';
-
-export interface SubagentCharacter {
-  id: number;
-  parentAgentId: number;
-  parentToolId: string;
-  label: string;
-}
 
 interface FurnitureAsset {
   id: string;
@@ -47,14 +48,10 @@ export interface WorkspaceFolder {
 }
 
 interface ExtensionMessageState {
-  agents: number[];
-  selectedAgent: number | null;
-  agentTools: Record<number, ToolActivity[]>;
-  agentStatuses: Record<number, string>;
-  subagentTools: Record<number, Record<string, ToolActivity[]>>;
-  subagentCharacters: SubagentCharacter[];
-  layoutReady: boolean;
-  layoutWasReset: boolean;
+  activeOfficeId: string;
+  setActiveOfficeId: (officeId: string) => void;
+  offices: OfficeDescriptor[];
+  officeBuckets: Record<string, OfficeBucketState>;
   loadedAssets?: { catalog: FurnitureAsset[]; sprites: Record<string, string[][]> };
   workspaceFolders: WorkspaceFolder[];
   externalAssetDirectories: string[];
@@ -68,30 +65,24 @@ interface ExtensionMessageState {
   hooksInfoShown: boolean;
 }
 
-function saveAgentSeats(os: OfficeState): void {
+function saveAgentSeats(os: OfficeState, officeId?: string): void {
   const seats: Record<number, { palette: number; hueShift: number; seatId: string | null }> = {};
   for (const ch of os.characters.values()) {
     if (ch.isSubagent) continue;
     seats[ch.id] = { palette: ch.palette, hueShift: ch.hueShift, seatId: ch.seatId };
   }
-  vscode.postMessage({ type: 'saveAgentSeats', seats });
+  vscode.postMessage({ type: 'saveAgentSeats', officeId, seats });
 }
 
 export function useExtensionMessages(
-  getOfficeState: () => OfficeState,
-  onLayoutLoaded?: (layout: OfficeLayout) => void,
+  getOfficeState: (officeId?: string) => OfficeState,
+  onLayoutLoaded?: (officeId: string, layout: OfficeLayout) => void,
   isEditDirty?: () => boolean,
 ): ExtensionMessageState {
-  const [agents, setAgents] = useState<number[]>([]);
-  const [selectedAgent, setSelectedAgent] = useState<number | null>(null);
-  const [agentTools, setAgentTools] = useState<Record<number, ToolActivity[]>>({});
-  const [agentStatuses, setAgentStatuses] = useState<Record<number, string>>({});
-  const [subagentTools, setSubagentTools] = useState<
-    Record<number, Record<string, ToolActivity[]>>
-  >({});
-  const [subagentCharacters, setSubagentCharacters] = useState<SubagentCharacter[]>([]);
-  const [layoutReady, setLayoutReady] = useState(false);
-  const [layoutWasReset, setLayoutWasReset] = useState(false);
+  const [activeOfficeId, setActiveOfficeId] = useState(DEFAULT_OFFICE_ID);
+  const [offices, setOffices] = useState<OfficeDescriptor[]>(mergeOfficeCatalog([]));
+  const [officeBuckets, setOfficeBuckets] =
+    useState<Record<string, OfficeBucketState>>(createOfficeBuckets());
   const [loadedAssets, setLoadedAssets] = useState<
     { catalog: FurnitureAsset[]; sprites: Record<string, string[][]> } | undefined
   >();
@@ -104,26 +95,55 @@ export function useExtensionMessages(
   const [hooksEnabled, setHooksEnabled] = useState(true);
   const [hooksInfoShown, setHooksInfoShown] = useState(true);
 
-  // Track whether initial layout has been loaded (ref to avoid re-render)
-  const layoutReadyRef = useRef(false);
+  const layoutReadyRef = useRef<Record<string, boolean>>({});
+  const agentOfficeMapRef = useRef<Map<number, string>>(new Map());
 
   useEffect(() => {
-    // Buffer agents from existingAgents until layout is loaded
-    let pendingAgents: Array<{
-      id: number;
-      palette?: number;
-      hueShift?: number;
-      seatId?: string;
-      folderName?: string;
-    }> = [];
+    const pendingAgentsByOffice: Record<
+      string,
+      Array<{
+        id: number;
+        palette?: number;
+        hueShift?: number;
+        seatId?: string;
+        folderName?: string;
+      }>
+    > = {};
+
+    const resolveMessageOfficeId = (msg: { officeId?: string; id?: number }): string => {
+      if (msg.officeId) {
+        return resolveOfficeId(msg.officeId);
+      }
+      if (typeof msg.id === 'number') {
+        return agentOfficeMapRef.current.get(msg.id) ?? DEFAULT_OFFICE_ID;
+      }
+      return DEFAULT_OFFICE_ID;
+    };
+
+    const updateOfficeBucket = (
+      officeId: string,
+      updater: (bucket: OfficeBucketState) => OfficeBucketState,
+    ) => {
+      setOfficeBuckets((prev) => {
+        const current = prev[officeId] ?? createEmptyOfficeBucket();
+        return { ...prev, [officeId]: updater(current) };
+      });
+    };
 
     const handler = (e: MessageEvent) => {
       const msg = e.data;
-      const os = getOfficeState();
 
-      if (msg.type === 'layoutLoaded') {
+      if (msg.type === 'officesLoaded') {
+        const merged = mergeOfficeCatalog((msg.offices as OfficeDescriptor[] | undefined) ?? []);
+        setOffices(merged);
+        setActiveOfficeId((prev) =>
+          merged.some((office) => office.officeId === prev) ? prev : DEFAULT_OFFICE_ID,
+        );
+      } else if (msg.type === 'layoutLoaded') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string });
+        const os = getOfficeState(officeId);
         // Skip external layout updates while editor has unsaved changes
-        if (layoutReadyRef.current && isEditDirty?.()) {
+        if (layoutReadyRef.current[officeId] && officeId === activeOfficeId && isEditDirty?.()) {
           console.log('[Webview] Skipping external layout update — editor has unsaved changes');
           return;
         }
@@ -131,39 +151,39 @@ export function useExtensionMessages(
         const layout = rawLayout && rawLayout.version === 1 ? migrateLayoutColors(rawLayout) : null;
         if (layout) {
           os.rebuildFromLayout(layout);
-          onLayoutLoaded?.(layout);
+          onLayoutLoaded?.(officeId, layout);
         } else {
-          // Default layout — snapshot whatever OfficeState built
-          onLayoutLoaded?.(os.getLayout());
+          onLayoutLoaded?.(officeId, os.getLayout());
         }
-        // Add buffered agents now that layout (and seats) are correct
-        for (const p of pendingAgents) {
+        for (const p of pendingAgentsByOffice[officeId] ?? []) {
           os.addAgent(p.id, p.palette, p.hueShift, p.seatId, true, p.folderName);
         }
-        pendingAgents = [];
-        layoutReadyRef.current = true;
-        setLayoutReady(true);
-        if (msg.wasReset) {
-          setLayoutWasReset(true);
-        }
+        pendingAgentsByOffice[officeId] = [];
+        layoutReadyRef.current[officeId] = true;
+        updateOfficeBucket(officeId, (bucket) => ({
+          ...bucket,
+          layoutReady: true,
+          layoutWasReset: bucket.layoutWasReset || Boolean(msg.wasReset),
+        }));
         if (os.characters.size > 0) {
-          saveAgentSeats(os);
+          saveAgentSeats(os, officeId);
         }
       } else if (msg.type === 'agentCreated') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
+        agentOfficeMapRef.current.set(id, officeId);
         const folderName = msg.folderName as string | undefined;
         const isTeammate = msg.isTeammate as boolean | undefined;
         const teammateName = msg.teammateName as string | undefined;
         const teammateParentId = msg.parentAgentId as number | undefined;
         const teamName = msg.teamName as string | undefined;
-        setAgents((prev) => (prev.includes(id) ? prev : [...prev, id]));
-        // Don't auto-select teammates (keep focus on lead)
-        if (!isTeammate) {
-          setSelectedAgent(id);
-        }
+        updateOfficeBucket(officeId, (bucket) => ({
+          ...bucket,
+          agents: bucket.agents.includes(id) ? bucket.agents : [...bucket.agents, id],
+          selectedAgent: !isTeammate ? id : bucket.selectedAgent,
+        }));
         if (isTeammate && teammateParentId !== undefined) {
-          // Teammate: inherit parent's palette and workspace folderName (teammate runs
-          // in the same workspace as the lead). Name shown via agentName (teamRoleLabel).
           const parentCh = os.characters.get(teammateParentId);
           const palette = parentCh ? parentCh.palette : undefined;
           const hueShift = parentCh ? parentCh.hueShift : undefined;
@@ -178,44 +198,44 @@ export function useExtensionMessages(
         } else {
           os.addAgent(id, undefined, undefined, undefined, undefined, folderName);
         }
-        saveAgentSeats(os);
+        saveAgentSeats(os, officeId);
       } else if (msg.type === 'agentClosed') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
-        setAgents((prev) => prev.filter((a) => a !== id));
-        setSelectedAgent((prev) => (prev === id ? null : prev));
-        setAgentTools((prev) => {
-          if (!(id in prev)) return prev;
-          const next = { ...prev };
-          delete next[id];
-          return next;
+        agentOfficeMapRef.current.delete(id);
+        updateOfficeBucket(officeId, (bucket) => {
+          const nextAgentTools = { ...bucket.agentTools };
+          delete nextAgentTools[id];
+          const nextAgentStatuses = { ...bucket.agentStatuses };
+          delete nextAgentStatuses[id];
+          const nextSubagentTools = { ...bucket.subagentTools };
+          delete nextSubagentTools[id];
+          return {
+            ...bucket,
+            agents: bucket.agents.filter((a) => a !== id),
+            selectedAgent: bucket.selectedAgent === id ? null : bucket.selectedAgent,
+            agentTools: nextAgentTools,
+            agentStatuses: nextAgentStatuses,
+            subagentTools: nextSubagentTools,
+            subagentCharacters: bucket.subagentCharacters.filter((s) => s.parentAgentId !== id),
+          };
         });
-        setAgentStatuses((prev) => {
-          if (!(id in prev)) return prev;
-          const next = { ...prev };
-          delete next[id];
-          return next;
-        });
-        setSubagentTools((prev) => {
-          if (!(id in prev)) return prev;
-          const next = { ...prev };
-          delete next[id];
-          return next;
-        });
-        // Remove all sub-agent characters belonging to this agent
         os.removeAllSubagents(id);
-        setSubagentCharacters((prev) => prev.filter((s) => s.parentAgentId !== id));
         os.removeAgent(id);
       } else if (msg.type === 'existingAgents') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string });
         const incoming = msg.agents as number[];
         const meta = (msg.agentMeta || {}) as Record<
           number,
           { palette?: number; hueShift?: number; seatId?: string }
         >;
         const folderNames = (msg.folderNames || {}) as Record<number, string>;
-        // Buffer agents — they'll be added in layoutLoaded after seats are built
+        pendingAgentsByOffice[officeId] ??= [];
         for (const id of incoming) {
+          agentOfficeMapRef.current.set(id, officeId);
           const m = meta[id];
-          pendingAgents.push({
+          pendingAgentsByOffice[officeId].push({
             id,
             palette: m?.palette,
             hueShift: m?.hueShift,
@@ -223,30 +243,35 @@ export function useExtensionMessages(
             folderName: folderNames[id],
           });
         }
-        setAgents((prev) => {
-          const ids = new Set(prev);
-          const merged = [...prev];
+        updateOfficeBucket(officeId, (bucket) => {
+          const ids = new Set(bucket.agents);
+          const merged = [...bucket.agents];
           for (const id of incoming) {
             if (!ids.has(id)) {
               merged.push(id);
             }
           }
-          return merged.sort((a, b) => a - b);
+          return { ...bucket, agents: merged.sort((a, b) => a - b) };
         });
       } else if (msg.type === 'agentToolStart') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
         const toolId = msg.toolId as string;
         const status = msg.status as string;
         const permissionActive = msg.permissionActive as boolean | undefined;
-        setAgentTools((prev) => {
-          const list = prev[id] || [];
-          if (list.some((t) => t.toolId === toolId)) return prev;
+        updateOfficeBucket(officeId, (bucket) => {
+          const list = bucket.agentTools[id] || [];
+          if (list.some((t) => t.toolId === toolId)) return bucket;
           return {
-            ...prev,
-            [id]: [
-              ...list,
-              { toolId, status, done: false, permissionWait: permissionActive || false },
-            ],
+            ...bucket,
+            agentTools: {
+              ...bucket.agentTools,
+              [id]: [
+                ...list,
+                { toolId, status, done: false, permissionWait: permissionActive || false },
+              ],
+            },
           };
         });
         const toolName = (msg.toolName as string | undefined) ?? extractToolName(status);
@@ -273,62 +298,78 @@ export function useExtensionMessages(
         ) {
           const label = status.startsWith('Subtask:') ? status.slice('Subtask:'.length).trim() : '';
           const subId = os.addSubagent(id, toolId);
-          setSubagentCharacters((prev) => {
-            if (prev.some((s) => s.id === subId)) return prev;
-            return [...prev, { id: subId, parentAgentId: id, parentToolId: toolId, label }];
+          updateOfficeBucket(officeId, (bucket) => {
+            if (bucket.subagentCharacters.some((s) => s.id === subId)) return bucket;
+            return {
+              ...bucket,
+              subagentCharacters: [
+                ...bucket.subagentCharacters,
+                { id: subId, parentAgentId: id, parentToolId: toolId, label },
+              ],
+            };
           });
         }
       } else if (msg.type === 'agentToolDone') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
         const id = msg.id as number;
         const toolId = msg.toolId as string;
-        setAgentTools((prev) => {
-          const list = prev[id];
-          if (!list) return prev;
+        updateOfficeBucket(officeId, (bucket) => {
+          const list = bucket.agentTools[id];
+          if (!list) return bucket;
           return {
-            ...prev,
-            [id]: list.map((t) => (t.toolId === toolId ? { ...t, done: true } : t)),
+            ...bucket,
+            agentTools: {
+              ...bucket.agentTools,
+              [id]: list.map((t) => (t.toolId === toolId ? { ...t, done: true } : t)),
+            },
           };
         });
       } else if (msg.type === 'agentToolsClear') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
-        setAgentTools((prev) => {
-          if (!(id in prev)) return prev;
-          const next = { ...prev };
-          delete next[id];
-          return next;
+        updateOfficeBucket(officeId, (bucket) => {
+          const nextAgentTools = { ...bucket.agentTools };
+          delete nextAgentTools[id];
+          const nextSubagentTools = { ...bucket.subagentTools };
+          delete nextSubagentTools[id];
+          const clearCh = os.characters.get(id);
+          const hasInlineTeammates =
+            clearCh?.teamName && clearCh?.isTeamLead && !clearCh?.teamUsesTmux;
+          return {
+            ...bucket,
+            agentTools: nextAgentTools,
+            subagentTools: nextSubagentTools,
+            subagentCharacters: hasInlineTeammates
+              ? bucket.subagentCharacters
+              : bucket.subagentCharacters.filter((s) => s.parentAgentId !== id),
+          };
         });
-        setSubagentTools((prev) => {
-          if (!(id in prev)) return prev;
-          const next = { ...prev };
-          delete next[id];
-          return next;
-        });
-        // Remove all sub-agent characters belonging to this agent.
-        // Exception: team leads with inline teammates -- their sub-agents represent
-        // real teammates and should only be removed by SubagentStop/subagentClear.
         const clearCh = os.characters.get(id);
         const hasInlineTeammates =
           clearCh?.teamName && clearCh?.isTeamLead && !clearCh?.teamUsesTmux;
         if (!hasInlineTeammates) {
           os.removeAllSubagents(id);
-          setSubagentCharacters((prev) => prev.filter((s) => s.parentAgentId !== id));
         }
         os.setAgentTool(id, null);
         os.clearPermissionBubble(id);
       } else if (msg.type === 'agentSelected') {
         const id = msg.id as number;
-        setSelectedAgent(id);
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        updateOfficeBucket(officeId, (bucket) => ({ ...bucket, selectedAgent: id }));
       } else if (msg.type === 'agentStatus') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
         const status = msg.status as string;
-        setAgentStatuses((prev) => {
+        updateOfficeBucket(officeId, (bucket) => {
           if (status === 'active') {
-            if (!(id in prev)) return prev;
-            const next = { ...prev };
+            if (!(id in bucket.agentStatuses)) return bucket;
+            const next = { ...bucket.agentStatuses };
             delete next[id];
-            return next;
+            return { ...bucket, agentStatuses: next };
           }
-          return { ...prev, [id]: status };
+          return { ...bucket, agentStatuses: { ...bucket.agentStatuses, [id]: status } };
         });
         os.setAgentActive(id, status === 'active');
         if (status === 'waiting') {
@@ -336,62 +377,73 @@ export function useExtensionMessages(
           playDoneSound();
         }
       } else if (msg.type === 'agentToolPermission') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
-        setAgentTools((prev) => {
-          const list = prev[id];
-          if (!list) return prev;
+        updateOfficeBucket(officeId, (bucket) => {
+          const list = bucket.agentTools[id];
+          if (!list) return bucket;
           return {
-            ...prev,
-            [id]: list.map((t) => (t.done ? t : { ...t, permissionWait: true })),
+            ...bucket,
+            agentTools: {
+              ...bucket.agentTools,
+              [id]: list.map((t) => (t.done ? t : { ...t, permissionWait: true })),
+            },
           };
         });
         os.showPermissionBubble(id);
         playPermissionSound();
       } else if (msg.type === 'subagentToolPermission') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
         const parentToolId = msg.parentToolId as string;
-        // Show permission bubble on the sub-agent character
         const subId = os.getSubagentId(id, parentToolId);
         if (subId !== null) {
           os.showPermissionBubble(subId);
         }
       } else if (msg.type === 'agentToolPermissionClear') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
-        setAgentTools((prev) => {
-          const list = prev[id];
-          if (!list) return prev;
+        updateOfficeBucket(officeId, (bucket) => {
+          const list = bucket.agentTools[id];
+          if (!list) return bucket;
           const hasPermission = list.some((t) => t.permissionWait);
-          if (!hasPermission) return prev;
+          if (!hasPermission) return bucket;
           return {
-            ...prev,
-            [id]: list.map((t) => (t.permissionWait ? { ...t, permissionWait: false } : t)),
+            ...bucket,
+            agentTools: {
+              ...bucket.agentTools,
+              [id]: list.map((t) => (t.permissionWait ? { ...t, permissionWait: false } : t)),
+            },
           };
         });
         os.clearPermissionBubble(id);
-        // Also clear permission bubbles on all sub-agent characters of this parent
         for (const [subId, meta] of os.subagentMeta) {
           if (meta.parentAgentId === id) {
             os.clearPermissionBubble(subId);
           }
         }
       } else if (msg.type === 'subagentToolStart') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
         const parentToolId = msg.parentToolId as string;
         const toolId = msg.toolId as string;
         const status = msg.status as string;
-        setSubagentTools((prev) => {
-          const agentSubs = prev[id] || {};
+        updateOfficeBucket(officeId, (bucket) => {
+          const agentSubs = bucket.subagentTools[id] || {};
           const list = agentSubs[parentToolId] || [];
-          if (list.some((t) => t.toolId === toolId)) return prev;
+          if (list.some((t) => t.toolId === toolId)) return bucket;
           return {
-            ...prev,
-            [id]: { ...agentSubs, [parentToolId]: [...list, { toolId, status, done: false }] },
+            ...bucket,
+            subagentTools: {
+              ...bucket.subagentTools,
+              [id]: { ...agentSubs, [parentToolId]: [...list, { toolId, status, done: false }] },
+            },
           };
         });
-        // Update sub-agent character's tool and active state (if already created by
-        // agentToolStart via PreToolUse). The lookup uses the REAL parent tool id from
-        // JSONL, which won't match the synthetic hook-id the sub-agent was created
-        // with -- so this is a best-effort update for the heuristic (JSONL-driven) path.
         const subId = os.getSubagentId(id, parentToolId);
         if (subId !== null) {
           const subToolName = extractToolName(status);
@@ -399,42 +451,56 @@ export function useExtensionMessages(
           os.setAgentActive(subId, true);
         }
       } else if (msg.type === 'subagentToolDone') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
         const id = msg.id as number;
         const parentToolId = msg.parentToolId as string;
         const toolId = msg.toolId as string;
-        setSubagentTools((prev) => {
-          const agentSubs = prev[id];
-          if (!agentSubs) return prev;
+        updateOfficeBucket(officeId, (bucket) => {
+          const agentSubs = bucket.subagentTools[id];
+          if (!agentSubs) return bucket;
           const list = agentSubs[parentToolId];
-          if (!list) return prev;
+          if (!list) return bucket;
           return {
-            ...prev,
-            [id]: {
-              ...agentSubs,
-              [parentToolId]: list.map((t) => (t.toolId === toolId ? { ...t, done: true } : t)),
+            ...bucket,
+            subagentTools: {
+              ...bucket.subagentTools,
+              [id]: {
+                ...agentSubs,
+                [parentToolId]: list.map((t) => (t.toolId === toolId ? { ...t, done: true } : t)),
+              },
             },
           };
         });
       } else if (msg.type === 'subagentClear') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
         const parentToolId = msg.parentToolId as string;
-        setSubagentTools((prev) => {
-          const agentSubs = prev[id];
-          if (!agentSubs || !(parentToolId in agentSubs)) return prev;
+        updateOfficeBucket(officeId, (bucket) => {
+          const agentSubs = bucket.subagentTools[id];
+          if (!agentSubs || !(parentToolId in agentSubs)) return bucket;
           const next = { ...agentSubs };
           delete next[parentToolId];
           if (Object.keys(next).length === 0) {
-            const outer = { ...prev };
+            const outer = { ...bucket.subagentTools };
             delete outer[id];
-            return outer;
+            return {
+              ...bucket,
+              subagentTools: outer,
+              subagentCharacters: bucket.subagentCharacters.filter(
+                (s) => !(s.parentAgentId === id && s.parentToolId === parentToolId),
+              ),
+            };
           }
-          return { ...prev, [id]: next };
+          return {
+            ...bucket,
+            subagentTools: { ...bucket.subagentTools, [id]: next },
+            subagentCharacters: bucket.subagentCharacters.filter(
+              (s) => !(s.parentAgentId === id && s.parentToolId === parentToolId),
+            ),
+          };
         });
-        // Remove sub-agent character
         os.removeSubagent(id, parentToolId);
-        setSubagentCharacters((prev) =>
-          prev.filter((s) => !(s.parentAgentId === id && s.parentToolId === parentToolId)),
-        );
       } else if (msg.type === 'characterSpritesLoaded') {
         const characters = msg.characters as Array<{
           down: string[][][];
@@ -494,6 +560,8 @@ export function useExtensionMessages(
           console.error(`❌ Webview: Error processing furnitureAssetsLoaded:`, err);
         }
       } else if (msg.type === 'agentTeamInfo') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
         os.setTeamInfo(
           id,
@@ -504,6 +572,8 @@ export function useExtensionMessages(
           msg.teamUsesTmux as boolean | undefined,
         );
       } else if (msg.type === 'agentTokenUsage') {
+        const officeId = resolveMessageOfficeId(msg as { officeId?: string; id?: number });
+        const os = getOfficeState(officeId);
         const id = msg.id as number;
         os.setAgentTokens(id, msg.inputTokens as number, msg.outputTokens as number);
       }
@@ -515,14 +585,10 @@ export function useExtensionMessages(
   }, [getOfficeState]);
 
   return {
-    agents,
-    selectedAgent,
-    agentTools,
-    agentStatuses,
-    subagentTools,
-    subagentCharacters,
-    layoutReady,
-    layoutWasReset,
+    activeOfficeId,
+    setActiveOfficeId,
+    offices,
+    officeBuckets,
     loadedAssets,
     workspaceFolders,
     externalAssetDirectories,

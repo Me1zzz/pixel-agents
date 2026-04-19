@@ -11,28 +11,32 @@ import { Tooltip } from './components/Tooltip.js';
 import { Modal } from './components/ui/Modal.js';
 import { VersionIndicator } from './components/VersionIndicator.js';
 import { ZoomControls } from './components/ZoomControls.js';
-import { useEditorActions } from './hooks/useEditorActions.js';
+import { createEditorSessionStore, useEditorActions } from './hooks/useEditorActions.js';
 import { useEditorKeyboard } from './hooks/useEditorKeyboard.js';
 import { useExtensionMessages } from './hooks/useExtensionMessages.js';
 import { OfficeCanvas } from './office/components/OfficeCanvas.js';
 import { ToolOverlay } from './office/components/ToolOverlay.js';
-import { EditorState } from './office/editor/editorState.js';
 import { EditorToolbar } from './office/editor/EditorToolbar.js';
 import { OfficeState } from './office/engine/officeState.js';
 import { isRotatable } from './office/layout/furnitureCatalog.js';
+import type { OfficeLayout } from './office/types.js';
 import { EditTool } from './office/types.js';
+import { listOfficeOptions } from './offices/officeStore.js';
 import { isBrowserRuntime } from './runtime.js';
 import { vscode } from './vscodeApi.js';
 
 // Game state lives outside React — updated imperatively by message handlers
-const officeStateRef = { current: null as OfficeState | null };
-const editorState = new EditorState();
+const officeStateRef = { current: new Map<string, OfficeState>() };
+const editorSessionStore = createEditorSessionStore();
 
-function getOfficeState(): OfficeState {
-  if (!officeStateRef.current) {
-    officeStateRef.current = new OfficeState();
+function getOfficeState(officeId = 'claude:default'): OfficeState {
+  const existing = officeStateRef.current.get(officeId);
+  if (existing) {
+    return existing;
   }
-  return officeStateRef.current;
+  const created = new OfficeState();
+  officeStateRef.current.set(officeId, created);
+  return created;
 }
 
 function App() {
@@ -44,22 +48,21 @@ function App() {
     }
   }, []);
 
-  const editor = useEditorActions(getOfficeState, editorState);
-
-  const isEditDirty = useCallback(
-    () => editor.isEditMode && editor.isDirty,
-    [editor.isEditMode, editor.isDirty],
+  const [editorOfficeId, setEditorOfficeId] = useState('claude:default');
+  const editorSession = editorSessionStore.get(editorOfficeId);
+  const editor = useEditorActions(
+    useCallback(() => editorOfficeId, [editorOfficeId]),
+    getOfficeState,
+    editorSession,
   );
 
+  const isEditDirty = useCallback(() => editor.isEditMode && editor.isDirty, [editor]);
+
   const {
-    agents,
-    selectedAgent,
-    agentTools,
-    agentStatuses,
-    subagentTools,
-    subagentCharacters,
-    layoutReady,
-    layoutWasReset,
+    activeOfficeId,
+    setActiveOfficeId,
+    offices,
+    officeBuckets,
     loadedAssets,
     workspaceFolders,
     externalAssetDirectories,
@@ -71,7 +74,30 @@ function App() {
     hooksEnabled,
     setHooksEnabled,
     hooksInfoShown,
-  } = useExtensionMessages(getOfficeState, editor.setLastSavedLayout, isEditDirty);
+  } = useExtensionMessages(
+    getOfficeState,
+    useCallback(
+      (officeId: string, layout: OfficeLayout) => {
+        editor.setLastSavedLayout(officeId, layout);
+      },
+      [editor],
+    ),
+    isEditDirty,
+  );
+
+  useEffect(() => {
+    setEditorOfficeId(activeOfficeId);
+  }, [activeOfficeId]);
+
+  const activeOfficeBucket = officeBuckets[activeOfficeId];
+  const agents = activeOfficeBucket?.agents ?? [];
+  const selectedAgent = activeOfficeBucket?.selectedAgent ?? null;
+  const agentTools = activeOfficeBucket?.agentTools ?? {};
+  const agentStatuses = activeOfficeBucket?.agentStatuses ?? {};
+  const subagentTools = activeOfficeBucket?.subagentTools ?? {};
+  const subagentCharacters = activeOfficeBucket?.subagentCharacters ?? [];
+  const layoutReady = activeOfficeBucket?.layoutReady ?? false;
+  const layoutWasReset = activeOfficeBucket?.layoutWasReset ?? false;
 
   // Show migration notice once layout reset is detected
   const [migrationNoticeDismissed, setMigrationNoticeDismissed] = useState(false);
@@ -118,7 +144,7 @@ function App() {
   const [editorTickForKeyboard, setEditorTickForKeyboard] = useState(0);
   useEditorKeyboard(
     editor.isEditMode,
-    editorState,
+    editorSession.editorState,
     editor.handleDeleteSelected,
     editor.handleRotateSelected,
     editor.handleToggleState,
@@ -132,15 +158,19 @@ function App() {
     vscode.postMessage({ type: 'closeAgent', id });
   }, []);
 
-  const handleClick = useCallback((agentId: number) => {
-    // If clicked agent is a sub-agent, focus the parent's terminal instead
-    const os = getOfficeState();
-    const meta = os.subagentMeta.get(agentId);
-    const focusId = meta ? meta.parentAgentId : agentId;
-    vscode.postMessage({ type: 'focusAgent', id: focusId });
-  }, []);
+  const handleClick = useCallback(
+    (agentId: number) => {
+      // If clicked agent is a sub-agent, focus the parent's terminal instead
+      const os = getOfficeState(activeOfficeId);
+      const meta = os.subagentMeta.get(agentId);
+      const focusId = meta ? meta.parentAgentId : agentId;
+      vscode.postMessage({ type: 'focusAgent', id: focusId });
+    },
+    [activeOfficeId],
+  );
 
-  const officeState = getOfficeState();
+  const officeState = getOfficeState(activeOfficeId);
+  const officeOptions = listOfficeOptions(offices);
 
   // Force dependency on editorTickForKeyboard to propagate keyboard-triggered re-renders
   void editorTickForKeyboard;
@@ -149,15 +179,15 @@ function App() {
   const showRotateHint =
     editor.isEditMode &&
     (() => {
-      if (editorState.selectedFurnitureUid) {
+      if (editorSession.editorState.selectedFurnitureUid) {
         const item = officeState
           .getLayout()
-          .furniture.find((f) => f.uid === editorState.selectedFurnitureUid);
+          .furniture.find((f) => f.uid === editorSession.editorState.selectedFurnitureUid);
         if (item && isRotatable(item.type)) return true;
       }
       if (
-        editorState.activeTool === EditTool.FURNITURE_PLACE &&
-        isRotatable(editorState.selectedFurnitureType)
+        editorSession.editorState.activeTool === EditTool.FURNITURE_PLACE &&
+        isRotatable(editorSession.editorState.selectedFurnitureType)
       ) {
         return true;
       }
@@ -171,10 +201,11 @@ function App() {
   return (
     <div ref={containerRef} className="w-full h-full relative overflow-hidden">
       <OfficeCanvas
+        key={`office-canvas:${activeOfficeId}`}
         officeState={officeState}
         onClick={handleClick}
         isEditMode={editor.isEditMode}
-        editorState={editorState}
+        editorState={editorSession.editorState}
         onEditorTileAction={editor.handleEditorTileAction}
         onEditorEraseAction={editor.handleEditorEraseAction}
         onEditorSelectionChange={editor.handleEditorSelectionChange}
@@ -198,7 +229,7 @@ function App() {
           />
 
           {editor.isEditMode && editor.isDirty && (
-            <EditActionBar editor={editor} editorState={editorState} />
+            <EditActionBar editor={editor} editorState={editorSession.editorState} />
           )}
 
           {showRotateHint && (
@@ -212,20 +243,20 @@ function App() {
 
           {editor.isEditMode &&
             (() => {
-              const selUid = editorState.selectedFurnitureUid;
+              const selUid = editorSession.editorState.selectedFurnitureUid;
               const selColor = selUid
                 ? (officeState.getLayout().furniture.find((f) => f.uid === selUid)?.color ?? null)
                 : null;
               return (
                 <EditorToolbar
-                  activeTool={editorState.activeTool}
-                  selectedTileType={editorState.selectedTileType}
-                  selectedFurnitureType={editorState.selectedFurnitureType}
+                  activeTool={editorSession.editorState.activeTool}
+                  selectedTileType={editorSession.editorState.selectedTileType}
+                  selectedFurnitureType={editorSession.editorState.selectedFurnitureType}
                   selectedFurnitureUid={selUid}
                   selectedFurnitureColor={selColor}
-                  floorColor={editorState.floorColor}
-                  wallColor={editorState.wallColor}
-                  selectedWallSet={editorState.selectedWallSet}
+                  floorColor={editorSession.editorState.floorColor}
+                  wallColor={editorSession.editorState.wallColor}
+                  selectedWallSet={editorSession.editorState.selectedWallSet}
                   onToolChange={editor.handleToolChange}
                   onTileTypeChange={editor.handleTileTypeChange}
                   onFloorColorChange={editor.handleFloorColorChange}
@@ -320,6 +351,9 @@ function App() {
       </Modal>
 
       <BottomToolbar
+        activeOfficeId={activeOfficeId}
+        officeOptions={officeOptions}
+        onOfficeChange={setActiveOfficeId}
         isEditMode={editor.isEditMode}
         onOpenClaude={editor.handleOpenClaude}
         onToggleEditMode={editor.handleToggleEditMode}
