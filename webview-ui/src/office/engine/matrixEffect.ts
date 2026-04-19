@@ -17,6 +17,11 @@ import {
 import type { Character, SpriteData } from '../types.js';
 import { MATRIX_EFFECT_DURATION } from '../types.js';
 
+type MatrixRenderContext = {
+  fillStyle: unknown;
+  fillRect(x: number, y: number, width: number, height: number): void;
+};
+
 /** Hash-based flicker: ~70% visible for shimmer effect */
 function flickerVisible(col: number, row: number, time: number): boolean {
   const t = Math.floor(time * MATRIX_FLICKER_FPS);
@@ -39,7 +44,7 @@ export { generateSeeds as matrixEffectSeeds };
  * Per-pixel rendering: each column sweeps top-to-bottom with a bright head and fading green trail.
  */
 export function renderMatrixEffect(
-  ctx: CanvasRenderingContext2D,
+  ctx: MatrixRenderContext,
   ch: Character,
   spriteData: SpriteData,
   drawX: number,
