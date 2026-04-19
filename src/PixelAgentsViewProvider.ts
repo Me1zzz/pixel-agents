@@ -45,6 +45,7 @@ import {
   GLOBAL_KEY_SOUND_ENABLED,
   GLOBAL_KEY_WATCH_ALL_SESSIONS,
   LAYOUT_REVISION_KEY,
+  OPENCODE_DISCOVERY_INTERVAL_MS,
   WORKSPACE_KEY_AGENT_SEATS,
 } from './constants.js';
 import {
@@ -62,6 +63,12 @@ import {
 } from './fileWatcher.js';
 import type { LayoutWatcher } from './layoutPersistence.js';
 import { readLayoutFromFile, watchLayoutFile, writeLayoutToFile } from './layoutPersistence.js';
+import { OfficeBridgeController, reconcileOpenCodeOfficeCatalog } from './offices/officeBridge.js';
+import { OfficeRegistry } from './offices/officeRegistry.js';
+import {
+  probeOpenCodeProcesses,
+  probeOpenCodeSessionList,
+} from './opencode/openCodeProcessProbe.js';
 import { setHookProvider } from './transcriptParser.js';
 import type { AgentState } from './types.js';
 
@@ -101,13 +108,31 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
 
   // Cross-window layout sync
   layoutWatcher: LayoutWatcher | null = null;
+  openCodeRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
   // Pixel Agents Server (hook event reception)
   private pixelAgentsServer: PixelAgentsServer | null = null;
   // ServerConfig is not stored as a field; use this.pixelAgentsServer?.getConfig() if needed.
   private hookEventHandler: HookEventHandler | null = null;
+  private readonly officeRegistry = new OfficeRegistry();
+  private readonly officeBridge: OfficeBridgeController;
 
   constructor(private readonly context: vscode.ExtensionContext) {
+    this.officeBridge = new OfficeBridgeController({
+      officeRegistry: this.officeRegistry,
+      postMessage: (message) => {
+        this.webview?.postMessage(message);
+      },
+      writeLegacyLayout: writeLayoutToFile,
+      markLegacyLayoutOwnWrite: () => {
+        this.layoutWatcher?.markOwnWrite();
+      },
+      readLegacySeats: () =>
+        this.context.workspaceState.get<Record<string, unknown>>(WORKSPACE_KEY_AGENT_SEATS, {}),
+      writeLegacySeats: (seats) => {
+        this.context.workspaceState.update(WORKSPACE_KEY_AGENT_SEATS, seats);
+      },
+    });
     this.initHooks();
   }
 
@@ -397,10 +422,15 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
       } else if (message.type === 'saveAgentSeats') {
         // Store seat assignments in a separate key (never touched by persistAgents)
         console.log(`[Pixel Agents] State: saveAgentSeats:`, JSON.stringify(message.seats));
-        this.context.workspaceState.update(WORKSPACE_KEY_AGENT_SEATS, message.seats);
+        this.officeBridge.saveAgentSeats({
+          officeId: message.officeId as string | undefined,
+          seats: message.seats as Record<string, unknown>,
+        });
       } else if (message.type === 'saveLayout') {
-        this.layoutWatcher?.markOwnWrite();
-        writeLayoutToFile(message.layout as Record<string, unknown>);
+        this.officeBridge.saveLayout({
+          officeId: message.officeId as string | undefined,
+          layout: message.layout as Record<string, unknown>,
+        });
       } else if (message.type === 'setSoundEnabled') {
         this.context.globalState.update(GLOBAL_KEY_SOUND_ENABLED, message.enabled);
       } else if (message.type === 'setLastSeenVersion') {
@@ -485,6 +515,8 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
         for (const agent of this.agents.values()) {
           this.registerAgentHook(agent);
         }
+        this.officeBridge.postOfficeCatalog();
+        this.startOpenCodeOfficeRefreshLoop();
         // Send persisted settings to webview
         const soundEnabled = this.context.globalState.get<boolean>(GLOBAL_KEY_SOUND_ENABLED, true);
         const lastSeenVersion = this.context.globalState.get<string>(
@@ -685,6 +717,7 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
           if (this.webview) {
             console.log('[Extension] Sending saved layout');
             sendLayout(this.context, this.webview, this.defaultLayout);
+            this.officeBridge.hydrateOpenCodeOffices(this.defaultLayout);
             // Send agent statuses AFTER layoutLoaded so characters exist when messages arrive
             sendCurrentAgentStatuses(this.agents, this.webview);
             this.startLayoutWatcher();
@@ -927,6 +960,38 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private startOpenCodeOfficeRefreshLoop(): void {
+    if (this.openCodeRefreshTimer) {
+      return;
+    }
+
+    this.officeBridge.startOpenCodeRefreshLoop();
+    this.openCodeRefreshTimer = setInterval(() => {
+      void this.refreshOpenCodeOfficeCatalog();
+    }, OPENCODE_DISCOVERY_INTERVAL_MS);
+    void this.refreshOpenCodeOfficeCatalog();
+  }
+
+  private async refreshOpenCodeOfficeCatalog(): Promise<void> {
+    try {
+      const [processProbe, sessions] = await Promise.all([
+        probeOpenCodeProcesses(),
+        probeOpenCodeSessionList(),
+      ]);
+      const now = Date.now();
+      reconcileOpenCodeOfficeCatalog({
+        officeRegistry: this.officeRegistry,
+        sessions,
+        activeRootSessionIds: processProbe.activeRootSessionIds,
+        now,
+      });
+      this.officeBridge.postOfficeCatalog();
+      this.officeBridge.hydrateOpenCodeOffices(this.defaultLayout);
+    } catch (err) {
+      console.error('[Pixel Agents] OpenCode office refresh failed:', err);
+    }
+  }
+
   dispose() {
     this.pixelAgentsServer?.stop();
     this.pixelAgentsServer = null;
@@ -957,6 +1022,10 @@ export class PixelAgentsViewProvider implements vscode.WebviewViewProvider {
     if (this.staleCheckTimer) {
       clearInterval(this.staleCheckTimer);
       this.staleCheckTimer = null;
+    }
+    if (this.openCodeRefreshTimer) {
+      clearInterval(this.openCodeRefreshTimer);
+      this.openCodeRefreshTimer = null;
     }
   }
 }

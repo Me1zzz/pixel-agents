@@ -16,6 +16,7 @@ import {
   startFileWatching,
 } from './fileWatcher.js';
 import { migrateAndLoadLayout } from './layoutPersistence.js';
+import { postOfficeScoped } from './offices/officeMessageRouter.js';
 import { cancelPermissionTimer, cancelWaitingTimer } from './timerManager.js';
 import type { AgentState, PersistedAgent } from './types.js';
 
@@ -286,22 +287,71 @@ export function persistAgents(
 ): void {
   const persisted: PersistedAgent[] = [];
   for (const agent of agents.values()) {
-    persisted.push({
-      id: agent.id,
-      sessionId: agent.sessionId,
-      terminalName: agent.terminalRef?.name ?? '',
-      isExternal: agent.isExternal || undefined,
-      jsonlFile: agent.jsonlFile,
-      projectDir: agent.projectDir,
-      folderName: agent.folderName,
-      teamName: agent.teamName,
-      agentName: agent.agentName,
-      isTeamLead: agent.isTeamLead,
-      leadAgentId: agent.leadAgentId,
-      teamUsesTmux: agent.teamUsesTmux,
-    });
+    persisted.push(toPersistedAgent(agent));
   }
   context.workspaceState.update(WORKSPACE_KEY_AGENTS, persisted);
+}
+
+export function toPersistedAgent(agent: AgentState): PersistedAgent {
+  return {
+    id: agent.id,
+    sessionId: agent.sessionId,
+    providerId: agent.providerId,
+    officeId: agent.officeId,
+    rootSessionId: agent.rootSessionId,
+    parentSessionId: agent.parentSessionId,
+    terminalName: agent.terminalRef?.name ?? '',
+    isExternal: agent.isExternal || undefined,
+    jsonlFile: agent.jsonlFile,
+    projectDir: agent.projectDir,
+    folderName: agent.folderName,
+    teamName: agent.teamName,
+    agentName: agent.agentName,
+    isTeamLead: agent.isTeamLead,
+    leadAgentId: agent.leadAgentId,
+    teamUsesTmux: agent.teamUsesTmux,
+  };
+}
+
+export function restoreAgentState(
+  persisted: PersistedAgent,
+  terminal: vscode.Terminal | undefined,
+): AgentState {
+  return {
+    id: persisted.id,
+    sessionId: persisted.sessionId || path.basename(persisted.jsonlFile, '.jsonl'),
+    officeId: persisted.officeId,
+    rootSessionId: persisted.rootSessionId,
+    parentSessionId: persisted.parentSessionId,
+    providerId: persisted.providerId,
+    terminalRef: terminal,
+    isExternal: persisted.isExternal ?? false,
+    projectDir: persisted.projectDir,
+    jsonlFile: persisted.jsonlFile,
+    fileOffset: 0,
+    lineBuffer: '',
+    activeToolIds: new Set(),
+    activeToolStatuses: new Map(),
+    activeToolNames: new Map(),
+    activeSubagentToolIds: new Map(),
+    activeSubagentToolNames: new Map(),
+    backgroundAgentToolIds: new Set(),
+    isWaiting: false,
+    permissionSent: false,
+    hadToolsInTurn: false,
+    lastDataAt: 0,
+    linesProcessed: 0,
+    seenUnknownRecordTypes: new Set(),
+    folderName: persisted.folderName,
+    hookDelivered: false,
+    inputTokens: 0,
+    outputTokens: 0,
+    teamName: persisted.teamName,
+    agentName: persisted.agentName,
+    isTeamLead: persisted.isTeamLead,
+    leadAgentId: persisted.leadAgentId,
+    teamUsesTmux: persisted.teamUsesTmux,
+  };
 }
 
 export function restoreAgents(
@@ -352,37 +402,13 @@ export function restoreAgents(
       if (!terminal) continue;
     }
 
-    const agent: AgentState = {
-      id: p.id,
-      sessionId: p.sessionId || path.basename(p.jsonlFile, '.jsonl'),
-      terminalRef: terminal,
-      isExternal,
-      projectDir: p.projectDir,
-      jsonlFile: p.jsonlFile,
-      fileOffset: 0,
-      lineBuffer: '',
-      activeToolIds: new Set(),
-      activeToolStatuses: new Map(),
-      activeToolNames: new Map(),
-      activeSubagentToolIds: new Map(),
-      activeSubagentToolNames: new Map(),
-      backgroundAgentToolIds: new Set(),
-      isWaiting: false,
-      permissionSent: false,
-      hadToolsInTurn: false,
-      lastDataAt: 0,
-      linesProcessed: 0,
-      seenUnknownRecordTypes: new Set(),
-      folderName: p.folderName,
-      hookDelivered: false,
-      inputTokens: 0,
-      outputTokens: 0,
-      teamName: p.teamName,
-      agentName: p.agentName,
-      isTeamLead: p.isTeamLead,
-      leadAgentId: p.leadAgentId,
-      teamUsesTmux: p.teamUsesTmux,
-    };
+    const agent = restoreAgentState(
+      {
+        ...p,
+        isExternal,
+      },
+      terminal,
+    );
 
     agents.set(p.id, agent);
     knownJsonlFiles.add(p.jsonlFile);
@@ -520,39 +546,60 @@ export function sendExistingAgents(
   webview: vscode.Webview | undefined,
 ): void {
   if (!webview) return;
-  const agentIds: number[] = [];
-  for (const id of agents.keys()) {
-    agentIds.push(id);
-  }
-  agentIds.sort((a, b) => a - b);
 
   // Include persisted palette/seatId from separate key
   const agentMeta = context.workspaceState.get<
     Record<string, { palette?: number; seatId?: string }>
   >(WORKSPACE_KEY_AGENT_SEATS, {});
 
-  // Include folderName and isExternal per agent
-  const folderNames: Record<number, string> = {};
-  const externalAgents: Record<number, boolean> = {};
+  const agentsByOffice = new Map<string, number[]>();
+  const folderNamesByOffice = new Map<string, Record<number, string>>();
+  const externalAgentsByOffice = new Map<string, Record<number, boolean>>();
+  const agentMetaByOffice = new Map<
+    string,
+    Record<string, { palette?: number; seatId?: string }>
+  >();
+
   for (const [id, agent] of agents) {
+    const officeId = agent.officeId ?? 'claude:default';
+    const officeAgents = agentsByOffice.get(officeId) ?? [];
+    officeAgents.push(id);
+    agentsByOffice.set(officeId, officeAgents);
+
     if (agent.folderName) {
+      const folderNames = folderNamesByOffice.get(officeId) ?? {};
       folderNames[id] = agent.folderName;
+      folderNamesByOffice.set(officeId, folderNames);
     }
+
     if (agent.isExternal) {
+      const externalAgents = externalAgentsByOffice.get(officeId) ?? {};
       externalAgents[id] = true;
+      externalAgentsByOffice.set(officeId, externalAgents);
+    }
+
+    const persistedMeta = agentMeta[String(id)];
+    if (persistedMeta) {
+      const officeMeta = agentMetaByOffice.get(officeId) ?? {};
+      officeMeta[String(id)] = persistedMeta;
+      agentMetaByOffice.set(officeId, officeMeta);
     }
   }
-  console.log(
-    `[Pixel Agents] sendExistingAgents: agents=${JSON.stringify(agentIds)}, meta=${JSON.stringify(agentMeta)}`,
-  );
 
-  webview.postMessage({
-    type: 'existingAgents',
-    agents: agentIds,
-    agentMeta,
-    folderNames,
-    externalAgents,
-  });
+  for (const [officeId, agentIds] of agentsByOffice) {
+    agentIds.sort((a, b) => a - b);
+    const scopedMeta = agentMetaByOffice.get(officeId) ?? {};
+    console.log(
+      `[Pixel Agents] sendExistingAgents(${officeId}): agents=${JSON.stringify(agentIds)}, meta=${JSON.stringify(scopedMeta)}`,
+    );
+    postOfficeScoped(webview, officeId, {
+      type: 'existingAgents',
+      agents: agentIds,
+      agentMeta: scopedMeta,
+      folderNames: folderNamesByOffice.get(officeId) ?? {},
+      externalAgents: externalAgentsByOffice.get(officeId) ?? {},
+    });
+  }
   // Note: sendCurrentAgentStatuses is called separately AFTER layoutLoaded
   // so that agentStatus/agentToolStart messages arrive after characters are created.
 }
@@ -563,10 +610,11 @@ export function sendCurrentAgentStatuses(
 ): void {
   if (!webview) return;
   for (const [agentId, agent] of agents) {
+    const officeId = agent.officeId ?? 'claude:default';
     // Re-send active tools
     for (const [toolId, status] of agent.activeToolStatuses) {
       const toolName = agent.activeToolNames.get(toolId) ?? '';
-      webview.postMessage({
+      postOfficeScoped(webview, officeId, {
         type: 'agentToolStart',
         id: agentId,
         toolId,
@@ -576,7 +624,7 @@ export function sendCurrentAgentStatuses(
     }
     // Re-send waiting status
     if (agent.isWaiting) {
-      webview.postMessage({
+      postOfficeScoped(webview, officeId, {
         type: 'agentStatus',
         id: agentId,
         status: 'waiting',
@@ -584,7 +632,7 @@ export function sendCurrentAgentStatuses(
     }
     // Re-send team metadata
     if (agent.teamName) {
-      webview.postMessage({
+      postOfficeScoped(webview, officeId, {
         type: 'agentTeamInfo',
         id: agentId,
         teamName: agent.teamName,
@@ -596,7 +644,7 @@ export function sendCurrentAgentStatuses(
     }
     // Re-send token usage
     if (agent.inputTokens > 0 || agent.outputTokens > 0) {
-      webview.postMessage({
+      postOfficeScoped(webview, officeId, {
         type: 'agentTokenUsage',
         id: agentId,
         inputTokens: agent.inputTokens,
