@@ -126,3 +126,62 @@ export async function clickAddAgent(frame: Frame): Promise<void> {
   await expect(btn).toBeVisible({ timeout: WEBVIEW_TIMEOUT_MS });
   await btn.click();
 }
+
+function officePickerButton(frame: Frame) {
+  return frame
+    .locator('button[title="Select office"], button[title="Only Claude office is available"]')
+    .first();
+}
+
+function officePickerContainer(frame: Frame) {
+  return officePickerButton(frame).locator('xpath=ancestor::div[1]');
+}
+
+function officeToolbar(frame: Frame) {
+  return officePickerButton(frame).locator('xpath=ancestor::div[2]');
+}
+
+export async function listOfficeTitles(frame: Frame): Promise<string[]> {
+  const pickerButton = officePickerButton(frame);
+  await expect(pickerButton).toBeVisible({ timeout: WEBVIEW_TIMEOUT_MS });
+  await pickerButton.click();
+
+  const buttons = officePickerContainer(frame).getByRole('button');
+  await expect
+    .poll(() => buttons.count(), {
+      timeout: WEBVIEW_TIMEOUT_MS,
+      intervals: [250, 500, 1000],
+    })
+    .toBeGreaterThan(1);
+
+  const titles = (await buttons.allInnerTexts())
+    .map((title) => title.trim())
+    .filter((title) => title.length > 0)
+    .slice(1);
+
+  await pickerButton.click();
+  return titles;
+}
+
+export async function selectOfficeByTitle(frame: Frame, title: string): Promise<void> {
+  const pickerButton = officePickerButton(frame);
+  await expect(pickerButton).toBeVisible({ timeout: WEBVIEW_TIMEOUT_MS });
+  await pickerButton.click();
+
+  const option = officePickerContainer(frame).getByRole('button', { name: title, exact: true });
+  await expect(option).toBeVisible({ timeout: WEBVIEW_TIMEOUT_MS });
+  await option.click();
+}
+
+export async function readVisibleToolbarButtonLabels(frame: Frame): Promise<string[]> {
+  const toolbar = officeToolbar(frame);
+  if ((await toolbar.count()) === 0) {
+    return [];
+  }
+
+  const labels = (await toolbar.getByRole('button').allInnerTexts())
+    .map((label) => label.trim())
+    .filter((label) => label.length > 0);
+
+  return labels;
+}
