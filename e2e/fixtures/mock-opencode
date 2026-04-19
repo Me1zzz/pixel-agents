@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Mock 'opencode' executable for Pixel Agents e2e tests.
+#
+# Supported commands:
+#   opencode session list --format json
+#   opencode mock-runtime <session-id>
+
+set -euo pipefail
+
+LOG_DIR="${HOME}/.opencode-mock"
+mkdir -p "$LOG_DIR"
+echo "$(date -Iseconds) cwd=$(pwd) args=$*" >> "${LOG_DIR}/invocations.log"
+
+if [ "$#" -ge 4 ] && [ "$1" = "session" ] && [ "$2" = "list" ] && [ "$3" = "--format" ] && [ "$4" = "json" ]; then
+  SESSION_FILE="${OPENCODE_MOCK_SESSION_LIST_FILE:-}"
+  if [ -n "$SESSION_FILE" ] && [ -f "$SESSION_FILE" ]; then
+    cat "$SESSION_FILE"
+  else
+    printf '[]\n'
+  fi
+  exit 0
+fi
+
+if [ "$#" -ge 1 ] && [ "$1" = "mock-runtime" ]; then
+  SESSION_ID="${2:-mock-session}"
+  echo "$(date -Iseconds) mode=mock-runtime session=${SESSION_ID}" >> "${LOG_DIR}/invocations.log"
+  exec bash -c 'sleep 600' opencode --opencode-session-id "${SESSION_ID}" --opencode-mock-runtime
+fi
+
+printf 'mock-opencode: unsupported args: %s\n' "$*" >&2
+exit 1

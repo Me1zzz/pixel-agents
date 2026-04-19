@@ -1,5 +1,6 @@
 import { _electron as electron } from '@playwright/test';
 import type { ElectronApplication, Page } from '@playwright/test';
+import { spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -8,9 +9,20 @@ const REPO_ROOT = path.join(__dirname, '../..');
 const VSCODE_PATH_FILE = path.join(REPO_ROOT, '.vscode-test/vscode-executable.txt');
 const MOCK_CLAUDE_PATH = path.join(REPO_ROOT, 'e2e/fixtures/mock-claude');
 const MOCK_CLAUDE_CMD_PATH = path.join(REPO_ROOT, 'e2e/fixtures/mock-claude.cmd');
+const MOCK_OPENCODE_PATH = path.join(REPO_ROOT, 'e2e/fixtures/mock-opencode');
+const MOCK_OPENCODE_CMD_PATH = path.join(REPO_ROOT, 'e2e/fixtures/mock-opencode.cmd');
+const MOCK_OPENCODE_RUNTIME_PS1_PATH = path.join(
+  REPO_ROOT,
+  'e2e/fixtures/mock-opencode-runtime.ps1',
+);
 const ARTIFACTS_DIR = path.join(REPO_ROOT, 'test-results/e2e');
 const IS_WINDOWS = process.platform === 'win32';
 const PATH_SEP = IS_WINDOWS ? ';' : ':';
+
+export interface LaunchVSCodeOptions {
+  openCodeSessionList?: unknown[];
+  openCodeRuntimeSessionIds?: string[];
+}
 
 export interface VSCodeSession {
   app: ElectronApplication;
@@ -21,6 +33,8 @@ export interface VSCodeSession {
   workspaceDir: string;
   /** Path to the mock invocations log. */
   mockLogFile: string;
+  /** Path to the mock OpenCode invocations log. */
+  openCodeMockLogFile: string;
   cleanup: () => Promise<void>;
 }
 
@@ -30,7 +44,10 @@ export interface VSCodeSession {
  * Uses an isolated temp HOME and injects the mock `claude` binary at the
  * front of PATH so no real Claude CLI is needed.
  */
-export async function launchVSCode(testTitle: string): Promise<VSCodeSession> {
+export async function launchVSCode(
+  testTitle: string,
+  options: LaunchVSCodeOptions = {},
+): Promise<VSCodeSession> {
   const vscodePath = fs.readFileSync(VSCODE_PATH_FILE, 'utf8').trim();
 
   // --- Isolated temp directories ---
@@ -74,11 +91,28 @@ export async function launchVSCode(testTitle: string): Promise<VSCodeSession> {
   if (IS_WINDOWS) {
     // Windows: copy the .cmd batch file as 'claude.cmd'
     fs.copyFileSync(MOCK_CLAUDE_CMD_PATH, path.join(mockBinDir, 'claude.cmd'));
+    fs.copyFileSync(MOCK_OPENCODE_CMD_PATH, path.join(mockBinDir, 'opencode.cmd'));
+    fs.copyFileSync(
+      MOCK_OPENCODE_RUNTIME_PS1_PATH,
+      path.join(mockBinDir, 'mock-opencode-runtime.ps1'),
+    );
   } else {
     const mockDest = path.join(mockBinDir, 'claude');
     fs.copyFileSync(MOCK_CLAUDE_PATH, mockDest);
     fs.chmodSync(mockDest, 0o755);
+
+    const mockOpenCodeDest = path.join(mockBinDir, 'opencode');
+    fs.copyFileSync(MOCK_OPENCODE_PATH, mockOpenCodeDest);
+    fs.chmodSync(mockOpenCodeDest, 0o755);
   }
+
+  const openCodeSessionListFile = path.join(tmpHome, '.opencode-mock', 'session-list.json');
+  fs.mkdirSync(path.dirname(openCodeSessionListFile), { recursive: true });
+  fs.writeFileSync(
+    openCodeSessionListFile,
+    JSON.stringify(options.openCodeSessionList ?? [], null, 2),
+    'utf8',
+  );
 
   // macOS: VS Code's integrated terminal resolves PATH from the login shell,
   // ignoring the process env. Define a custom terminal profile that uses a
@@ -112,6 +146,7 @@ export async function launchVSCode(testTitle: string): Promise<VSCodeSession> {
   }
 
   const mockLogFile = path.join(tmpHome, '.claude-mock', 'invocations.log');
+  const openCodeMockLogFile = path.join(tmpHome, '.opencode-mock', 'invocations.log');
 
   // --- Video output dir ---
   const safeTitle = testTitle.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
@@ -124,9 +159,32 @@ export async function launchVSCode(testTitle: string): Promise<VSCodeSession> {
     HOME: tmpHome,
     // Prepend mock bin so 'claude' resolves to our mock
     PATH: `${mockBinDir}${PATH_SEP}${process.env['PATH'] ?? '/usr/local/bin:/usr/bin:/bin'}`,
+    OPENCODE_MOCK_SESSION_LIST_FILE: openCodeSessionListFile,
     // Prevent VS Code from trying to talk to real accounts / telemetry
     VSCODE_TELEMETRY_DISABLED: '1',
   };
+
+  const openCodeRuntimePids: number[] = [];
+  for (const sessionId of options.openCodeRuntimeSessionIds ?? []) {
+    const child = IS_WINDOWS
+      ? spawn('cmd', ['/c', 'opencode', 'mock-runtime', sessionId], {
+          cwd: resolvedWorkspaceDir,
+          env,
+          detached: true,
+          windowsHide: true,
+          stdio: 'ignore',
+        })
+      : spawn('opencode', ['mock-runtime', sessionId], {
+          cwd: resolvedWorkspaceDir,
+          env,
+          detached: true,
+          stdio: 'ignore',
+        });
+    if (typeof child.pid === 'number') {
+      openCodeRuntimePids.push(child.pid);
+    }
+    child.unref();
+  }
 
   // --- VS Code launch args ---
   const args = [
@@ -155,6 +213,22 @@ export async function launchVSCode(testTitle: string): Promise<VSCodeSession> {
   ];
 
   const cleanup = async (): Promise<void> => {
+    for (const pid of openCodeRuntimePids) {
+      try {
+        if (IS_WINDOWS) {
+          const killer = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
+            windowsHide: true,
+            stdio: 'ignore',
+          });
+          killer.unref();
+        } else {
+          process.kill(-pid, 'SIGTERM');
+        }
+      } catch {
+        // ignore process cleanup errors
+      }
+    }
+
     try {
       if (app) {
         await app.close();
@@ -214,7 +288,15 @@ export async function launchVSCode(testTitle: string): Promise<VSCodeSession> {
       await window.waitForTimeout(500);
     }
 
-    return { app, window, tmpHome, workspaceDir: resolvedWorkspaceDir, mockLogFile, cleanup };
+    return {
+      app,
+      window,
+      tmpHome,
+      workspaceDir: resolvedWorkspaceDir,
+      mockLogFile,
+      openCodeMockLogFile,
+      cleanup,
+    };
   } catch (error) {
     await cleanup();
     throw error;
