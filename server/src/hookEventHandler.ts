@@ -3,6 +3,7 @@
 import * as path from 'path';
 import type * as vscode from 'vscode';
 
+import { postOfficeScoped } from '../../src/offices/officeMessageRouter.js';
 import { cancelPermissionTimer, cancelWaitingTimer } from '../../src/timerManager.js';
 import type { AgentState } from '../../src/types.js';
 import { HOOK_EVENT_BUFFER_MS, SESSION_END_GRACE_MS } from './constants.js';
@@ -80,6 +81,14 @@ export class HookEventHandler {
   private lifecycleCallbacks: SessionLifecycleCallbacks = {};
   /** Pending external sessions waiting for a confirmation event (Stop, Notification, etc.). */
   private pendingExternalSessions = new Map<string, PendingExternalSession>();
+
+  private postAgentMessage(
+    webview: vscode.Webview | undefined,
+    agent: AgentState,
+    payload: Record<string, unknown> & { type: string },
+  ): void {
+    postOfficeScoped(webview, agent.officeId ?? 'claude:default', payload);
+  }
 
   constructor(
     private agents: Map<number, AgentState>,
@@ -436,7 +445,7 @@ export class HookEventHandler {
     // can find and remove them. JSONL handles agentToolStart (with runInBackground)
     // for these tools.
     if (toolName !== 'Task' && toolName !== 'Agent') {
-      webview?.postMessage({
+      this.postAgentMessage(webview, agent, {
         type: 'agentToolStart',
         id: agentId,
         toolId: hookToolId,
@@ -444,7 +453,7 @@ export class HookEventHandler {
         toolName,
       });
     }
-    webview?.postMessage({
+    this.postAgentMessage(webview, agent, {
       type: 'agentStatus',
       id: agentId,
       status: 'active',
@@ -464,7 +473,7 @@ export class HookEventHandler {
     if (agent.currentHookToolId) {
       // Suppress tool display when lead has inline teammates (see handlePreToolUse)
       if (!hasInlineTeammates(agentId, this.agents)) {
-        webview?.postMessage({
+        this.postAgentMessage(webview, agent, {
           type: 'agentToolDone',
           id: agentId,
           toolId: agent.currentHookToolId,
@@ -546,7 +555,7 @@ export class HookEventHandler {
     }
     subNames.set(subToolId, agentType);
 
-    webview?.postMessage({
+    this.postAgentMessage(webview, agent, {
       type: 'subagentToolStart',
       id: agentId,
       parentToolId,
@@ -603,7 +612,7 @@ export class HookEventHandler {
 
     agent.activeSubagentToolIds.delete(parentToolId);
     agent.activeSubagentToolNames.delete(parentToolId);
-    webview?.postMessage({
+    this.postAgentMessage(webview, agent, {
       type: 'subagentClear',
       id: agentId,
       parentToolId,
@@ -623,20 +632,20 @@ export class HookEventHandler {
       for (const [id, a] of inlineTeammates) {
         cancelPermissionTimer(id, this.permissionTimers);
         a.permissionSent = true;
-        webview?.postMessage({ type: 'agentToolPermission', id });
+        this.postAgentMessage(webview, a, { type: 'agentToolPermission', id });
       }
       return;
     }
 
     cancelPermissionTimer(agentId, this.permissionTimers);
     agent.permissionSent = true;
-    webview?.postMessage({
+    this.postAgentMessage(webview, agent, {
       type: 'agentToolPermission',
       id: agentId,
     });
     // Also notify any sub-agents with active tools
     for (const parentToolId of agent.activeSubagentToolNames.keys()) {
-      webview?.postMessage({
+      this.postAgentMessage(webview, agent, {
         type: 'subagentToolPermission',
         id: agentId,
         parentToolId,
@@ -756,12 +765,12 @@ export class HookEventHandler {
         agent.activeSubagentToolNames.delete(toolId);
       }
     }
-    webview?.postMessage({ type: 'agentToolsClear', id: agentId });
+    this.postAgentMessage(webview, agent, { type: 'agentToolsClear', id: agentId });
     // Re-send background agent tools to restore them after the clear
     for (const toolId of agent.backgroundAgentToolIds) {
       const status = agent.activeToolStatuses.get(toolId);
       if (status) {
-        webview?.postMessage({
+        this.postAgentMessage(webview, agent, {
           type: 'agentToolStart',
           id: agentId,
           toolId,
@@ -773,7 +782,7 @@ export class HookEventHandler {
     agent.isWaiting = true;
     agent.permissionSent = false;
     agent.hadToolsInTurn = false;
-    webview?.postMessage({
+    this.postAgentMessage(webview, agent, {
       type: 'agentStatus',
       id: agentId,
       status: 'waiting',

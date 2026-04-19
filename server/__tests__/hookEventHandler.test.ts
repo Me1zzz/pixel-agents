@@ -168,6 +168,36 @@ describe('HookEventHandler', () => {
     expect(waitMsg).toBeTruthy();
   });
 
+  it('scopes runtime hook messages to the owning non-Claude office', () => {
+    const agent = createTestAgent({
+      id: 1,
+      officeId: 'opencode:root:root-1',
+    } as Partial<AgentState>);
+    agents.set(1, agent);
+    handler.registerAgent('sess-1', 1);
+
+    handler.handleEvent('claude', {
+      hook_event_name: 'Stop',
+      session_id: 'sess-1',
+    });
+
+    expect(mockWebview.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'agentToolsClear',
+          id: 1,
+          officeId: 'opencode:root:root-1',
+        }),
+        expect.objectContaining({
+          type: 'agentStatus',
+          id: 1,
+          status: 'waiting',
+          officeId: 'opencode:root:root-1',
+        }),
+      ]),
+    );
+  });
+
   it('Stop clears foreground tools but preserves background agents', () => {
     const agent = createTestAgent({ id: 1 });
     agent.activeToolIds.add('fg-tool');
