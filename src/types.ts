@@ -3,6 +3,9 @@ import type * as vscode from 'vscode';
 export interface AgentState {
   id: number;
   sessionId: string;
+  officeId?: string;
+  rootSessionId?: string;
+  parentSessionId?: string;
   /** Terminal reference — undefined for extension panel sessions */
   terminalRef?: vscode.Terminal;
   /** Whether this agent was detected from an external source (VS Code extension panel, etc.) */
@@ -62,6 +65,10 @@ export interface AgentState {
 export interface PersistedAgent {
   id: number;
   sessionId?: string;
+  providerId?: string;
+  officeId?: string;
+  rootSessionId?: string;
+  parentSessionId?: string;
   /** Terminal name — empty string for extension panel sessions */
   terminalName: string;
   /** Whether this agent was detected from an external source */
