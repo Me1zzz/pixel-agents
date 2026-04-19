@@ -1,13 +1,14 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 function runOpenCodeSessionTypesCheck(): { success: boolean; output: string } {
   const repoRoot = join(__dirname, '..', '..');
-  const tempDir = mkdtempSync(join(tmpdir(), 'pixel-agents-opencode-types-'));
+  const tempRoot = join(repoRoot, '.tmp-tests');
+  mkdirSync(tempRoot, { recursive: true });
+  const tempDir = mkdtempSync(join(tempRoot, 'pixel-agents-opencode-types-'));
   const fixturePath = join(tempDir, 'openCodeSessionTypes.fixture.ts');
   const typesModulePath = join(repoRoot, 'src', 'opencode', 'openCodeSessionTypes.ts');
   let importPath = relative(dirname(fixturePath), typesModulePath)
@@ -100,7 +101,9 @@ void [persistentRoot, ephemeralRoot];
 
 function runOpenCodeIdentityContractCheck(): { success: boolean; output: string } {
   const repoRoot = join(__dirname, '..', '..');
-  const tempDir = mkdtempSync(join(tmpdir(), 'pixel-agents-opencode-identity-'));
+  const tempRoot = join(repoRoot, '.tmp-tests');
+  mkdirSync(tempRoot, { recursive: true });
+  const tempDir = mkdtempSync(join(tempRoot, 'pixel-agents-opencode-identity-'));
   const fixturePath = join(tempDir, 'openCodeIdentity.fixture.ts');
   const identityModulePath = join(repoRoot, 'src', 'opencode', 'openCodeIdentity.ts');
   let importPath = relative(dirname(fixturePath), identityModulePath)
